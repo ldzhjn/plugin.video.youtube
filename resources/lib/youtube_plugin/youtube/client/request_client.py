@@ -526,6 +526,23 @@ class YouTubeRequestClient(BaseRequestsClass):
                 'X-YouTube-Client-Version': '{_id[client_version]}',
             },
         },
+        # Legacy TV responses include all audio tracks and direct DASH URLs.
+        # Stream URLs require a working nsig solver.
+        'tv_legacy': {
+            '_id': {'client_id': 7, 'client_name': 'TVHTML5',
+                    'client_version': '5.20260707'},
+            '_auth_type': 'tv',
+            '_auth_requested': True,
+            'json': {'context': {'client': {
+                'clientName': '{_id[client_name]}',
+                'clientVersion': '{_id[client_version]}',
+            }}},
+            'headers': {
+                'User-Agent': 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+                'X-YouTube-Client-Name': '{_id[client_id]}',
+                'X-YouTube-Client-Version': '{_id[client_version]}',
+            },
+        },
         # Used to requests captions for clients that don't provide them
         # Requires handling of nsig to overcome throttling (TODO)
         'tv_embed': {
