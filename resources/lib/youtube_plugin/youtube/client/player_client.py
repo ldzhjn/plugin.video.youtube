@@ -32,6 +32,7 @@ from ...kodion.compatibility import (
     urlencode,
     urlsplit,
     urlunsplit,
+    xbmc,
     xbmcvfs,
 )
 from ...kodion.constants import INCOGNITO, PATHS, TEMP_PATH, VALUE_TO_STR
@@ -845,10 +846,16 @@ class YouTubePlayerClient(YouTubeDataClient):
         self._language_prefer_default = prefer_default
 
         self._player_js = None
-        # signatureCipher and nsig handling currently broken and disabled
-        # self._calculate_n = True
-        # self._cipher = None
-        self._calculate_n = False
+        # signatureCipher remains disabled. tvOS can solve nsig on-device.
+        self._native_nsig = None
+        if xbmc.getCondVisibility('System.Platform.TVOS'):
+            try:
+                from ..helper import nsig
+                if nsig.available():
+                    self._native_nsig = nsig
+            except ImportError:
+                pass
+        self._calculate_n = bool(self._native_nsig)
         self._cipher = False
 
         self._visitor_data = {
@@ -862,6 +869,8 @@ class YouTubePlayerClient(YouTubeDataClient):
                 'tv_unplugged',
                 'tv',
             )),
+            ('auth_enabled|multi_audio',
+             ('tv_legacy',) if self._native_nsig else ()),
             ('auth_disabled|kids|av1|vp9|vp9.2|avc1|stereo_sound|multi_audio', (
                 'ios_testsuite_params',
             )),
@@ -1436,16 +1445,26 @@ class YouTubePlayerClient(YouTubeDataClient):
                 self._player_js = self._get_player_js()
             if self._calculate_n is True:
                 self.log.debug('Detected nsig in stream url')
-                self._calculate_n = ratebypass.CalculateN(self._player_js)
+                try:
+                    solver = self._native_nsig or ratebypass
+                    self._calculate_n = solver.CalculateN(self._player_js)
+                except Exception:
+                    self.log.error('Unable to initialise nsig solver')
+                    self._calculate_n = False
+                    return None
 
             # Cipher n to get the updated value
-            new_n = self._calculate_n.calculate_n(params['n'][0])
+            try:
+                new_n = self._calculate_n.calculate_n(params['n'][0])
+            except Exception:
+                new_n = None
             if new_n:
                 new_params['n'] = new_n
                 new_params['ratebypass'] = ['yes']
             else:
                 self.log.error('nsig handling failed')
                 self._calculate_n = False
+                return None
 
         if 'lmt' in params:
             snippet = (self.yt_item or {}).get('snippet')
@@ -2114,6 +2133,23 @@ class YouTubePlayerClient(YouTubeDataClient):
 
         return stream_list.values(), yt_item
 
+    @staticmethod
+    def _hdr_transfer(stream, codecs):
+        transfer = stream.get('colorInfo', {}).get('transferCharacteristics')
+        if transfer:
+            return {
+                'COLOR_TRANSFER_CHARACTERISTICS_SMPTE2084': 16,
+                'COLOR_TRANSFER_CHARACTERISTICS_ARIB_STD_B67': 18,
+            }.get(transfer, 1)
+        # AV1's optional CICP fields include transfer at index 7.
+        fields = codecs.split('.')
+        if fields[0] == 'av01' and len(fields) > 7:
+            try:
+                return int(fields[7])
+            except ValueError:
+                pass
+        return None
+
     def _process_adaptive_streams(self,
                                   responses,
                                   default_lang_code='und',
@@ -2232,7 +2268,7 @@ class YouTubePlayerClient(YouTubeDataClient):
 
                         language = audio_track.get('id', default_lang_code)
                         if '.' in language:
-                            language_code, role_id = language.split('.')
+                            language_code, role_id = language.rsplit('.', 1)
                         else:
                             language_code = language
                             role_id = '4'
@@ -2244,7 +2280,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                     # Unsure of what other audio types are available
                     # Role set to "alternate" as default fallback
                     if not role_details:
-                        role_details = lang_role_details[0]
+                        role_details = lang_role_details['0']
                     role_type, role, role_order = role_details
 
                     preferred_order = preferred_audio['role_order']
@@ -2314,7 +2350,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                         quality_group = mime_group
 
                     height = width = fps = frame_rate = None
-                    is_hdr = is_vr = is_3d = None
+                    is_hdr = is_vr = is_3d = transfer = None
 
                     log_audio = debugging
                     log_video = False
@@ -2332,12 +2368,9 @@ class YouTubePlayerClient(YouTubeDataClient):
                     if fps > 30 and not allow_hfr:
                         continue
 
-                    if 'colorInfo' in stream:
-                        is_hdr = not any(
-                            value.endswith('BT709')
-                            for value in stream['colorInfo'].values()
-                        )
-                    else:
+                    transfer = self._hdr_transfer(stream, codecs)
+                    is_hdr = transfer in (16, 18)
+                    if transfer is None:
                         is_hdr = 'HDR' in stream.get('qualityLabel', '')
                     if is_hdr and not allow_hdr:
                         continue
@@ -2398,6 +2431,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                         codec,
                         is_hdr,
                         is_vr,
+                        transfer,
                     )
 
                     label = quality['label'].format(
@@ -2411,6 +2445,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                         container,
                         codec,
                         label,
+                        transfer,
                     )
 
                     channels = sample_rate = is_drc = is_spa = None
@@ -2438,7 +2473,8 @@ class YouTubePlayerClient(YouTubeDataClient):
                     'codecs': codecs,
                     'codec': codec,
                     'preferred_codec': preferred_codec,
-                    'id': itag,
+                    'id': ('.'.join((itag, language_code, role_id))
+                           if media_type == 'audio' else itag),
                     'width': width,
                     'height': height,
                     'label': label,
@@ -2450,6 +2486,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                     'fps': fps,
                     'frameRate': frame_rate,
                     'hdr': is_hdr,
+                    'transfer': transfer,
                     'projection': is_vr,
                     'stereoLayout': is_3d,
                     'indexRange': '{start}-{end}'.format(**index_range),
@@ -2664,6 +2701,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                 skip_group
                 and new_stream['fps'] == previous_stream['fps']
                 and new_stream['hdr'] == previous_stream['hdr']
+                and new_stream.get('transfer') == previous_stream.get('transfer')
                 if media_type == 'video' else
                 skip_group
                 and new_stream['langCode'] == previous_stream['langCode']
@@ -2722,11 +2760,13 @@ class YouTubePlayerClient(YouTubeDataClient):
             role = stream['role'] or ''
 
             if group[0] == mime_type and 'auto' in stream_select:
-                label = '{0} [{1}]'.format(
-                    stream['langName']
-                    or localize('stream.automatic'),
-                    stream['label']
-                )
+                if media_type == 'video':
+                    # Adaptive streams can change resolution during playback.
+                    label = '{0} [{1}{2}]'.format(
+                        localize('stream.automatic'), stream['codec'],
+                        ' HDR' if stream['hdr'] else '')
+                else:
+                    label = '{0} [{1}]'.format(stream['langName'], stream['label'])
                 if stream == main_stream[media_type]:
                     default = True
                     role = 'main'
@@ -2754,6 +2794,7 @@ class YouTubePlayerClient(YouTubeDataClient):
             elif role == 'description':
                 impaired = True
 
+            label = entity_escape(label)
             languages.add(language)
             roles.add(role)
 
@@ -2782,6 +2823,13 @@ class YouTubePlayerClient(YouTubeDataClient):
                     '/>\n'
             ))
 
+            if media_type == 'video' and stream.get('transfer') in (16, 18):
+                output.extend((
+                    '\t\t\t<SupplementalProperty'
+                    ' schemeIdUri="urn:mpeg:mpegB:cicp:TransferCharacteristics"'
+                    ' value="', str(stream['transfer']), '"/>\n',
+                ))
+
             num_streams = len(streams)
             if media_type == 'audio':
                 output.extend([(
@@ -2790,7 +2838,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                         ' codecs="{codecs}"'
                         ' mimeType="{mimeType}"'
                         ' bandwidth="{bitrate}"'
-                        ' sampleRate="{sampleRate}"'
+                        ' audioSamplingRate="{sampleRate}"'
                         ' numChannels="{channels}"'
                         # quality and priority attributes are not used by ISA
                         ' qualityRanking="{quality}"'
