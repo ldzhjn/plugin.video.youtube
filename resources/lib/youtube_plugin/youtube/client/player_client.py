@@ -962,6 +962,8 @@ class YouTubePlayerClient(YouTubeDataClient):
             audio_info = info.get('audio') or {}
             yt_format['audio']['codec'] = audio_info.get('codec', '')
             yt_format['audio']['bitrate'] = audio_info.get('bitrate', 0) // 1000
+            if info.get('preferred_audio'):
+                yt_format['preferred_audio'] = info['preferred_audio']
 
         video_info = yt_format.get('video')
         if video_info:
@@ -2624,6 +2626,46 @@ class YouTubePlayerClient(YouTubeDataClient):
                 stream['drc'],
             )
 
+        def _normalize_language(language):
+            return language.replace('_', '-').lower()
+
+        # Apply this preference to playable tracks, after codec and URL checks.
+        # Regional/script tags such as zh-Hant and en-US share a language family.
+        language_families = {
+            _normalize_language(group[-2]).split('-', 1)[0]
+            for group in audio_data
+        }
+        preferred_family = ('zh' if 'zh' in language_families else
+                            'en' if {'ja', 'en'} <= language_families else
+                            None)
+        if preferred_family:
+            def _audio_language_sort(group):
+                language_code, role_id = group[-2:]
+                language = _normalize_language(language_code)
+                role_type, _, role_order = lang_role_details.get(
+                    role_id, lang_role_details['0'])
+                preferred_order = role_order
+                if ((role_type == 'dub' and prefer_dub)
+                        or (role_type == 'dub.auto' and prefer_auto_dub)):
+                    preferred_order = 0
+                return (
+                    language.split('-', 1)[0] != preferred_family,
+                    -preferred_order,
+                    -role_order,
+                    language != _normalize_language(default_lang),
+                    language,
+                    language_code,
+                    role_id,
+                )
+
+            # Role preference takes priority over the regional variant. Stable
+            # language/role ties avoid depending on a client's response order.
+            preferred_group = min(audio_data, key=_audio_language_sort)
+            preferred_audio.update(
+                language_code=preferred_group[-2],
+                role_id=preferred_group[-1],
+            )
+
         def _group_sort(item):
             group, streams = item
             main_stream = streams[0]
@@ -2648,6 +2690,11 @@ class YouTubePlayerClient(YouTubeDataClient):
             (group, sorted(streams.values(), key=_stream_sort))
             for group, streams in audio_data.items()
         ), key=_group_sort)
+        if preferred_family:
+            audio_data[0][1][0]['preferredAudio'] = {
+                'language': preferred_audio['language_code'],
+                'role': preferred_audio['role_id'],
+            }
 
         return video_data, audio_data
 
@@ -2722,6 +2769,8 @@ class YouTubePlayerClient(YouTubeDataClient):
             'multi_audio': False,
             'multi_language': False,
         }
+        if main_stream['audio'].get('preferredAudio'):
+            main_stream['preferred_audio'] = main_stream['audio']['preferredAudio']
         if video_data:
             main_stream['video'] = video_data[0][1][0]
             duration = main_stream['video']['duration']
