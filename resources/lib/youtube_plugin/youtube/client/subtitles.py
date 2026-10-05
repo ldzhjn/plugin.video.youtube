@@ -203,7 +203,7 @@ class Subtitles(YouTubeRequestClient):
             if track.get('kind') == 'asr'
             and track.get('languageCode') == default_caption.get('languageCode')
         ]
-        original_caption = asr_caption and asr_caption[0] or {}
+        original_caption = asr_caption[0] if asr_caption else default_caption
 
         self.defaults = {
             'default_lang': default_caption.get('languageCode') or 'und',
@@ -523,7 +523,7 @@ class Subtitles(YouTubeRequestClient):
         return True
 
     def get_preferred(self, subtitles):
-        tracks = [track for track in (subtitles or {}).values() if track.get('url')]
+        tracks = [track for track in (subtitles or {}).values() if track and track.get('url')]
         if not tracks:
             return None
 

@@ -130,6 +130,12 @@ class SubtitleTests(unittest.TestCase):
         self.load([])
         self.assertEqual({}, self.subtitles.get_subtitles())
 
+    def test_manual_caption_language_is_retained_as_a_fallback(self):
+        self.load([caption('ja')])
+        selected = self.subtitles.get_subtitles()
+        self.assertIn('ja', selected)
+        self.assertEqual('ja', self.subtitles.get_lang_details()['original'])
+
     def test_multilingual_asr_uses_the_selected_caption_language_as_translation_source(self):
         self.load([caption('ar', asr=True), caption('en', asr=True)],
                   defaultAudioTrackIndex=1,
