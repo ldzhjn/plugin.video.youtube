@@ -478,6 +478,60 @@ class PlayerMonitor(xbmc.Player):
         except (KeyError, TypeError, ValueError, RuntimeError):
             self.log.debug('Unable to select preferred audio at playback start')
 
+    def _apply_preferred_subtitle(self, player_data):
+        preferred = player_data.get('preferred_subtitle') or {}
+        language = preferred.get('language')
+        playing_file = player_data.get('playing_file')
+        if not language or not playing_file:
+            return
+
+        try:
+            current_file = self.getPlayingFile()
+            if not (current_file.startswith(playing_file)
+                    or (self._context.is_plugin_path(current_file, PATHS.PLAY)
+                        and 'video_id=%s' % player_data.get(VIDEO_ID) in current_file)):
+                return
+            players = jsonrpc(method='Player.GetActivePlayers').get('result') or []
+            player_id = next((player.get('playerid') for player in players
+                              if player.get('type') == 'video'), None)
+            if player_id is None:
+                return
+            properties = jsonrpc(
+                method='Player.GetProperties',
+                params={'playerid': player_id,
+                        'properties': ['subtitles', 'currentsubtitle', 'subtitleenabled']},
+            ).get('result') or {}
+            family = self._audio_language_family(language)
+            candidates = [stream for stream in properties.get('subtitles', [])
+                          if self._audio_language_family(stream.get('language')) == family]
+            exact = [stream for stream in candidates
+                     if (stream.get('language') or '').replace('_', '-').lower()
+                     == language.replace('_', '-').lower()]
+            candidates = exact or candidates
+            filename = preferred.get('filename')
+            if filename:
+                # External subtitle names contain the filename before its final
+                # language/extension, e.g. "video asr (External)" for video.asr.en.vtt.
+                prefix = filename.rsplit('.', 2)[0].replace('.', ' ').lower()
+                named = [stream for stream in candidates
+                         if (stream.get('name') or '').lower().startswith(prefix)]
+                candidates = named or candidates
+            if len(candidates) != 1:
+                defaults = [stream for stream in candidates if stream.get('isdefault')]
+                if len(defaults) != 1:
+                    return
+                candidates = defaults
+            index = candidates[0].get('index')
+            current = properties.get('currentsubtitle') or {}
+            if (isinstance(index, int) and index >= 0
+                    and (index != current.get('index') or not properties.get('subtitleenabled'))):
+                # A successful YouTube subtitle selection is local to this
+                # playback. Preserve Kodi's global language/forced preference.
+                self.setSubtitleStream(index)
+                self.log.debug('Selected preferred subtitle: %s', language)
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            self.log.debug('Unable to select preferred subtitle at playback start')
+
     def onAVStarted(self):
         ui = self._ui
         if ui.get_property(PLAY_USING, as_bool=True):
@@ -494,6 +548,7 @@ class PlayerMonitor(xbmc.Player):
         # Consume PLAYER_DATA before selecting so later callbacks and manual
         # track changes cannot apply this startup preference again.
         self._apply_preferred_audio(player_data)
+        self._apply_preferred_subtitle(player_data)
         self.cleanup_threads()
 
         try:

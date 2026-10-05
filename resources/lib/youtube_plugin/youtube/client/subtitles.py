@@ -163,10 +163,10 @@ class Subtitles(YouTubeRequestClient):
         self.translation_langs.extend(TRANSLATION_LANGUAGES)
 
         try:
-            default_audio = renderer.get('defaultAudioTrackIndex')
-            default_audio = renderer.get('audioTracks')[default_audio]
+            default_audio = renderer.get('defaultAudioTrackIndex', 0)
+            default_audio = (renderer.get('audioTracks') or [])[default_audio]
         except (IndexError, TypeError):
-            default_audio = None
+            default_audio = {}
 
         self.defaults = {
             'default_lang': 'und',
@@ -175,12 +175,8 @@ class Subtitles(YouTubeRequestClient):
             'base': None,
             'base_lang': None
         }
-        if default_audio is None:
-            return
-
-        default_caption = renderer.get(
-            'defaultTranslationSourceTrackIndices', [None]
-        )[0]
+        sources = renderer.get('defaultTranslationSourceTrackIndices') or []
+        default_caption = sources[0] if sources else None
 
         if default_caption is None and default_audio.get('hasDefaultTrack'):
             default_caption = default_audio.get('defaultCaptionTrackIndex')
@@ -193,13 +189,19 @@ class Subtitles(YouTubeRequestClient):
 
         try:
             default_caption = self.caption_tracks[default_caption] or {}
-        except IndexError:
-            return
+        except (IndexError, TypeError):
+            if not self.caption_tracks:
+                return
+            default_caption = self.caption_tracks[0]
 
+        # TV responses can contain an ASR track for every dubbed language.
+        # Their order is unrelated to the original audio or selected captions.
+        # Use the chosen caption language, rather than the first ASR entry.
         asr_caption = [
             track
             for track in self.caption_tracks
             if track.get('kind') == 'asr'
+            and track.get('languageCode') == default_caption.get('languageCode')
         ]
         original_caption = asr_caption and asr_caption[0] or {}
 
@@ -269,6 +271,7 @@ class Subtitles(YouTubeRequestClient):
             fallback_langs = None
 
         subtitles = {}
+        attempted = set()
         for lang in allowed_langs:
             if lang != 'ASR':
                 track_details = self._get_track(lang, use_asr=use_asr)
@@ -288,10 +291,14 @@ class Subtitles(YouTubeRequestClient):
                 track_key = '_'.join((track_lang, track_kind))
             else:
                 track_key = track_lang
+            if track_key in attempted:
+                continue
+            attempted.add(track_key)
             url, sub_format = self._get_url(track=track, lang=track_lang)
             if url:
                 subtitles[track_key] = {
-                    'default': track_lang in preferred_lang,
+                    'default': any(self._language_key(track_lang) == self._language_key(lang)
+                                   for lang in preferred_lang),
                     'original': track_lang == original_lang,
                     'kind': track_kind,
                     'lang': track_lang,
@@ -321,7 +328,8 @@ class Subtitles(YouTubeRequestClient):
                 else:
                     track_key = track_lang
                 subtitles[track_key] = {
-                    'default': track_lang in preferred_lang,
+                    'default': any(self._language_key(track_lang) == self._language_key(lang)
+                                   for lang in preferred_lang),
                     'original': track_lang == original_lang,
                     'kind': track_kind,
                     'lang': track_lang,
@@ -343,7 +351,8 @@ class Subtitles(YouTubeRequestClient):
                 if url:
                     track_key = '_'.join((base_lang, track_lang))
                     subtitles[track_key] = {
-                        'default': track_lang in preferred_lang,
+                        'default': any(self._language_key(track_lang) == self._language_key(lang)
+                                       for lang in preferred_lang),
                         'original': track_lang == original_lang,
                         'kind': 'translation',
                         'lang': track_lang,
@@ -434,22 +443,26 @@ class Subtitles(YouTubeRequestClient):
 
         download = self.pre_download
         if download:
-            filename = '.'.join((
-                self.video_id,
-                lang,
-                self.FORMATS[sub_format]['extension']
-            ))
+            # Kodi reads the language from the final filename component. Keep
+            # the ASR marker/source language before the actual subtitle language.
+            name = ((self.video_id, base_lang, tlang) if tlang else
+                    (self.video_id, 'asr', base_lang) if kind == 'asr' else
+                    (self.video_id, base_lang))
+            filename = '.'.join(name + (self.FORMATS[sub_format]['extension'],))
             if not self.BASE_PATH:
                 self.log.error_trace('Unable to access temp directory')
                 return None, None
 
             file_path = os.path.join(self.BASE_PATH, filename)
             if xbmcvfs.exists(file_path):
-                self.log.debug(('Use existing subtitle for: {lang!r}',
-                                'File: {file}'),
-                               lang=lang,
-                               file=file_path)
-                return file_path, self.FORMATS[sub_format]
+                with xbmcvfs.File(file_path, 'r') as sub_file:
+                    existing = sub_file.read()
+                if self._has_cues(existing, sub_format):
+                    self.log.debug(('Use existing subtitle for: {lang!r}',
+                                    'File: {file}'),
+                                   lang=lang,
+                                   file=file_path)
+                    return file_path, self.FORMATS[sub_format]
 
         base_url = self._normalize_url(track.get('baseUrl'))
         if not base_url:
@@ -480,12 +493,14 @@ class Subtitles(YouTubeRequestClient):
             return None, None
         with response:
             response_text = response.text
-            if not response_text:
+            if not self._has_cues(response_text, sub_format):
+                self.log.debug('No valid subtitle cues for: %r', lang)
                 return None, None
 
         output = bytearray(self._unescape(response_text),
                            encoding='utf8',
                            errors='ignore')
+        success = False
         try:
             with xbmcvfs.File(file_path, 'w') as sub_file:
                 success = sub_file.write(output)
@@ -497,6 +512,39 @@ class Subtitles(YouTubeRequestClient):
         if success:
             return file_path, self.FORMATS[sub_format]
         return None, None
+
+    @staticmethod
+    def _has_cues(content, sub_format):
+        if not content:
+            return False
+        if sub_format == 'vtt':
+            content = content.lstrip('\ufeff \t\r\n')
+            return content.startswith('WEBVTT') and '-->' in content
+        return True
+
+    def get_preferred(self, subtitles):
+        tracks = [track for track in (subtitles or {}).values() if track.get('url')]
+        if not tracks:
+            return None
+
+        def priority(track):
+            language = track.get('lang', '')
+            preferred = self.preferred_lang
+            return (not any(self._language_key(language) == self._language_key(lang)
+                            for lang in preferred),
+                    not any(language.partition('-')[0] == lang.partition('-')[0]
+                            for lang in preferred),
+                    language != self.defaults['default_lang'])
+
+        track = min(tracks, key=priority)
+        return {'language': track['lang'],
+                'filename': os.path.basename(track['url']) if self.pre_download else None}
+
+    @staticmethod
+    def _language_key(language):
+        language = (language or '').replace('_', '-').lower()
+        return {'zh': 'zh-hans', 'zh-cn': 'zh-hans',
+                'zh-tw': 'zh-hant', 'zh-hk': 'zh-hant'}.get(language, language)
 
     def _get_track(self,
                    lang='en',
@@ -510,7 +558,7 @@ class Subtitles(YouTubeRequestClient):
             track_language = self._get_language_name(track)
             track_kind = track.get('kind')
             is_asr = track_kind == 'asr'
-            if lang and lang != track_lang:
+            if lang and self._language_key(lang) != self._language_key(track_lang):
                 continue
             if not lang and fallbacks and track_lang not in fallbacks:
                 continue
@@ -536,10 +584,13 @@ class Subtitles(YouTubeRequestClient):
                 and use_asr is None
                 and self.defaults['base']
                 and lang != self.defaults['base_lang']):
-            for track in self.translation_langs:
-                if lang == track.get('languageCode'):
+            translations = sorted(self.translation_langs,
+                                  key=lambda track: (track.get('languageCode') or '').replace('_', '-').lower()
+                                  != self._language_key(lang))
+            for track in translations:
+                if self._language_key(lang) == self._language_key(track.get('languageCode')):
                     sel_track = self.defaults['base']
-                    sel_lang = lang
+                    sel_lang = track.get('languageCode').replace('_', '-')
                     sel_language = self._get_language_name(track)
                     sel_kind = 'translation'
                     break

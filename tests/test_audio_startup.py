@@ -19,7 +19,8 @@ CONSTANTS = ('BUSY_FLAG', 'CHANNEL_ID', 'INCOGNITO', 'PLAYBACK_INIT', 'PLAYER_DA
 def load_playback():
     tree = ast.parse(MONITOR.read_text())
     original = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'PlayerMonitor')
-    methods = {'_audio_language_family', '_apply_preferred_audio', 'onAVStarted', 'onAVChange'}
+    methods = {'_audio_language_family', '_apply_preferred_audio', '_apply_preferred_subtitle',
+               'onAVStarted', 'onAVChange'}
     body = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in methods]
     client = ast.ClassDef(name='Monitor', bases=[], keywords=[], body=body, decorator_list=[])
     play = next(n for n in ast.parse(PLAY.read_text()).body
@@ -60,13 +61,20 @@ class AudioStartupTests(unittest.TestCase):
         self.playing_file = ''
         self.actual_streams = []
         self.current = -1
+        self.actual_subtitles = []
+        self.current_subtitle = -1
+        self.subtitle_enabled = False
+        self.selected_subtitles = []
 
         def rpc(**kwargs):
             self.rpc_calls.append(kwargs)
             if kwargs['method'] == 'Player.GetActivePlayers':
                 return {'result': [{'playerid': 1, 'type': 'video'}]}
             return {'result': {'audiostreams': self.actual_streams,
-                               'currentaudiostream': {'index': self.current}}}
+                               'currentaudiostream': {'index': self.current},
+                               'subtitles': self.actual_subtitles,
+                               'currentsubtitle': {'index': self.current_subtitle},
+                               'subtitleenabled': self.subtitle_enabled}}
 
         self.namespace['jsonrpc'] = rpc
         self.namespace['PlayerMonitorThread'] = lambda *args: SimpleNamespace()
@@ -81,13 +89,15 @@ class AudioStartupTests(unittest.TestCase):
         self.monitor.getTime = lambda: 0
         self.monitor.getTotalTime = lambda: 10
         self.monitor.setAudioStream = self.selected.append
+        self.monitor.setSubtitleStream = self.selected_subtitles.append
         self.monitor.log = SimpleNamespace(debug=lambda *a, **kw: None)
 
-    def start_data(self, tracks, kodi_languages=None):
+    def start_data(self, tracks, kodi_languages=None, preferred_subtitle=None):
         root, _, info = self.manifest.manifest([manifests.video(699, 1920, 1080)] + tracks)
         client = self.manifest.client
         client.FORMAT = {'9999': {'container': 'MPD', 'title': '', 'video': {}, 'audio': {}}}
         stream = client._get_stream_format('9999', info=info, url='http://localhost/fixture.mpd')
+        stream.setdefault('meta', {})['preferred_subtitle'] = preferred_subtitle
         self.playing_file = stream['url']
         self.actual_streams = [
             {'index': i, 'language': (kodi_languages or {}).get(s.get('lang'), s.get('lang')),
@@ -188,6 +198,42 @@ class AudioStartupTests(unittest.TestCase):
         self.monitor.onAVStarted()
         self.assertFalse(self.selected)
         self.assertEqual(1, len(self.monitor.threads))
+
+    def test_selected_external_subtitle_is_enabled_once_and_manual_off_is_preserved(self):
+        data = self.start_data([manifests.audio('fr.4')], preferred_subtitle={
+            'language': 'en', 'filename': 'fixture.asr.en.vtt'})
+        self.assertEqual('en', data['preferred_subtitle']['language'])
+        self.actual_subtitles = [
+            {'index': 0, 'language': 'ar', 'name': 'fixture asr (External)'},
+            {'index': 1, 'language': 'en', 'name': 'fixture asr (External)'},
+        ]
+        self.current_subtitle = 0
+        self.monitor.onAVStarted()
+        self.assertEqual([1], self.selected_subtitles)
+        self.subtitle_enabled = False
+        self.monitor.onAVChange()
+        self.monitor.onAVStarted()
+        self.assertEqual([1], self.selected_subtitles)
+
+    def test_current_subtitle_is_enabled_when_forced_only_initially_hides_it(self):
+        self.start_data([manifests.audio('fr.4')], preferred_subtitle={'language': 'zh-Hans'})
+        self.actual_subtitles = [{'index': 2, 'language': 'zho', 'name': 'Chinese'}]
+        self.current_subtitle = 2
+        self.monitor.onAVStarted()
+        self.assertEqual([2], self.selected_subtitles)
+
+    def test_no_successful_subtitle_selection_does_not_enable_other_tracks(self):
+        self.start_data([manifests.audio('fr.4')])
+        self.actual_subtitles = [{'index': 0, 'language': 'ar', 'name': 'Arabic'}]
+        self.monitor.onAVStarted()
+        self.assertFalse(self.selected_subtitles)
+
+    def test_subtitle_preference_does_not_apply_to_another_playback(self):
+        self.start_data([manifests.audio('fr.4')], preferred_subtitle={'language': 'en'})
+        self.actual_subtitles = [{'index': 1, 'language': 'en', 'name': 'English'}]
+        self.playing_file = 'http://localhost/unrelated.mpd'
+        self.monitor.onAVStarted()
+        self.assertFalse(self.selected_subtitles)
 
 
 if __name__ == '__main__':

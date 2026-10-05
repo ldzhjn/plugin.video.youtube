@@ -533,6 +533,7 @@ class YouTubeRequestClient(BaseRequestsClass):
                     'client_version': '5.20260707'},
             '_auth_type': 'tv',
             '_auth_requested': True,
+            '_use_subtitles': True,
             'json': {'context': {'client': {
                 'clientName': '{_id[client_name]}',
                 'clientVersion': '{_id[client_version]}',

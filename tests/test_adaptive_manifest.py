@@ -204,6 +204,38 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(details['multi_language'])
         self.assertIn('English & US', next(s for s in sets if s.get('lang') == 'en-US').get('name'))
 
+    def test_nonstandard_aspect_ratio_uses_actual_height_not_quality_limit(self):
+        for width, height in ((2560, 1600), (2880, 1440), (2048, 1536),
+                              (2560, 1080), (2048, 1080)):
+            with self.subTest(width=width, height=height):
+                root, _, _ = self.manifest([video(400, width, height), audio()])
+                fixed = next(s for s in root.findall('.//d:AdaptationSet[@contentType="video"]', NS)
+                             if 'Automatic' not in s.get('name'))
+                self.assertIn(str(height)+'p', fixed.get('name'))
+                self.assertNotIn('4K', fixed.get('name'))
+                representation = fixed.find('d:Representation', NS)
+                self.assertEqual(str(width), representation.get('width'))
+                self.assertEqual(str(height), representation.get('height'))
+
+    def test_cropped_uhd_retains_width_and_actual_height_in_label(self):
+        root, _, _ = self.manifest([video(401, 3840, 1600), audio()])
+        fixed = next(s for s in root.findall('.//d:AdaptationSet[@contentType="video"]', NS)
+                     if 'Automatic' not in s.get('name'))
+        self.assertIn('1600p', fixed.get('name'))
+        self.assertIn('4K', fixed.get('name'))
+        representation = fixed.find('d:Representation', NS)
+        self.assertEqual('3840', representation.get('width'))
+        self.assertEqual('1600', representation.get('height'))
+
+    def test_fixed_groups_do_not_mix_actual_dimensions_with_same_height_label(self):
+        root, _, _ = self.manifest([video(400, 2560, 1440), video(399, 2048, 1440), audio()])
+        fixed_sets = [s for s in root.findall('.//d:AdaptationSet[@contentType="video"]', NS)
+                      if 'Automatic' not in s.get('name')]
+        self.assertEqual(2, len(fixed_sets))
+        self.assertTrue(all(len(s.findall('d:Representation', NS)) == 1 for s in fixed_sets))
+        self.assertEqual({'2048', '2560'},
+                         {s.find('d:Representation', NS).get('width') for s in fixed_sets})
+
     def test_unknown_audio_role_is_kept_as_alternate(self):
         root, _, _ = self.manifest([video(699, 1920, 1080), audio('en-US.42'), audio('ja.4')])
         self.assertTrue(root.findall('.//d:AdaptationSet[@lang="en-US"]', NS))

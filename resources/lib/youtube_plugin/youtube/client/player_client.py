@@ -2033,6 +2033,7 @@ class YouTubePlayerClient(YouTubeDataClient):
                 subtitles=subtitles,
                 responses=responses,
             )
+            meta_info['preferred_subtitle'] = subtitles.get_preferred(subs_data)
             if subs_data and not subtitles.use_isa:
                 meta_info['subtitles'] = [
                     subtitle['url'] for subtitle in subs_data.values()
@@ -2436,8 +2437,22 @@ class YouTubePlayerClient(YouTubeDataClient):
                         transfer,
                     )
 
-                    label = quality['label'].format(
-                        quality['nom_height'] or compare_height,
+                    # Quality limits use approximate aspect ratios. Use the
+                    # actual height for the label so a 2560x1600 stream is not
+                    # advertised as 2160p merely because it fits the 4K bucket.
+                    label_quality = next((
+                        item for item in qualities
+                        if item['nom_height'] == compare_height
+                    ), qualities[-1])
+                    # Cropped 4K/8K video still has its full horizontal size.
+                    if compare_width >= 3840:
+                        label_quality = next((
+                            item for item in qualities
+                            if item['nom_height'] == (
+                                4320 if compare_width >= 7680 else 2160)
+                        ), label_quality)
+                    label = label_quality['label'].format(
+                        compare_height,
                         fps if fps > 30 else '',
                         ' HDR' if is_hdr else '',
                         ' 3D' if is_3d else '',
@@ -2448,6 +2463,9 @@ class YouTubePlayerClient(YouTubeDataClient):
                         codec,
                         label,
                         transfer,
+                        width,
+                        height,
+                        fps,
                     )
 
                     channels = sample_rate = is_drc = is_spa = None

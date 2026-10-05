@@ -193,6 +193,7 @@ def _play_stream(provider, context):
         'use_local_history': use_local_history,
         'playback_stats': playback_stats,
         'preferred_audio': stream.get('preferred_audio'),
+        'preferred_subtitle': metadata.get('preferred_subtitle'),
         'seek_time': seek_time,
         'start_time': start_time,
         'end_time': end_time,
