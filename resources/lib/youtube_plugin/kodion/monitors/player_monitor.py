@@ -28,6 +28,7 @@ from ..constants import (
 )
 from ..utils.redact import redact_params
 from ..utils.convert_format import channel_filter_split
+from ..utils.methods import jsonrpc
 
 
 class PlayerMonitorThread(object):
@@ -430,6 +431,107 @@ class PlayerMonitor(xbmc.Player):
             self._context.execute('Action(Stop)')
             return
 
+    @staticmethod
+    def _audio_language_family(language):
+        language = (language or '').replace('_', '-').lower().split('-', 1)[0]
+        return {'chi': 'zh', 'zho': 'zh', 'jpn': 'ja', 'eng': 'en'}.get(language, language)
+
+    def _apply_preferred_audio(self, player_data):
+        preferred = player_data.get('preferred_audio') or {}
+        language = preferred.get('language')
+        playing_file = player_data.get('playing_file')
+        if not language or not playing_file:
+            return
+
+        try:
+            # PLAYER_DATA belongs to a single YouTube playback request. Avoid
+            # applying stale data if another video was started instead.
+            current_file = self.getPlayingFile()
+            if not (current_file.startswith(playing_file)
+                    or (self._context.is_plugin_path(current_file, PATHS.PLAY)
+                        and 'video_id=%s' % player_data.get(VIDEO_ID) in current_file)):
+                return
+            players = jsonrpc(method='Player.GetActivePlayers').get('result') or []
+            player_id = next((player.get('playerid') for player in players
+                              if player.get('type') == 'video'), None)
+            if player_id is None:
+                return
+            properties = jsonrpc(
+                method='Player.GetProperties',
+                params={'playerid': player_id,
+                        'properties': ['audiostreams', 'currentaudiostream']},
+            ).get('result') or {}
+            family = self._audio_language_family(language)
+            defaults = [stream for stream in properties.get('audiostreams', [])
+                        if stream.get('isdefault')
+                        and self._audio_language_family(stream.get('language')) == family]
+            # The manifest's single default already includes the selected role
+            # and codec. Do not replace it with an arbitrary same-language dub.
+            if len(defaults) != 1:
+                return
+            index = defaults[0].get('index')
+            current = properties.get('currentaudiostream') or {}
+            if isinstance(index, int) and index >= 0 and index != current.get('index'):
+                self.setAudioStream(index)
+                self.log.debug('Selected preferred audio: %s (role %s)',
+                               language, preferred.get('role'))
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            self.log.debug('Unable to select preferred audio at playback start')
+
+    def _apply_preferred_subtitle(self, player_data):
+        preferred = player_data.get('preferred_subtitle') or {}
+        language = preferred.get('language')
+        playing_file = player_data.get('playing_file')
+        if not language or not playing_file:
+            return
+
+        try:
+            current_file = self.getPlayingFile()
+            if not (current_file.startswith(playing_file)
+                    or (self._context.is_plugin_path(current_file, PATHS.PLAY)
+                        and 'video_id=%s' % player_data.get(VIDEO_ID) in current_file)):
+                return
+            players = jsonrpc(method='Player.GetActivePlayers').get('result') or []
+            player_id = next((player.get('playerid') for player in players
+                              if player.get('type') == 'video'), None)
+            if player_id is None:
+                return
+            properties = jsonrpc(
+                method='Player.GetProperties',
+                params={'playerid': player_id,
+                        'properties': ['subtitles', 'currentsubtitle', 'subtitleenabled']},
+            ).get('result') or {}
+            family = self._audio_language_family(language)
+            candidates = [stream for stream in properties.get('subtitles', [])
+                          if self._audio_language_family(stream.get('language')) == family]
+            exact = [stream for stream in candidates
+                     if (stream.get('language') or '').replace('_', '-').lower()
+                     == language.replace('_', '-').lower()]
+            candidates = exact or candidates
+            filename = preferred.get('filename')
+            if filename:
+                # External subtitle names contain the filename before its final
+                # language/extension, e.g. "video asr (External)" for video.asr.en.vtt.
+                prefix = filename.rsplit('.', 2)[0].replace('.', ' ').lower()
+                named = [stream for stream in candidates
+                         if (stream.get('name') or '').lower().startswith(prefix)]
+                candidates = named or candidates
+            if len(candidates) != 1:
+                defaults = [stream for stream in candidates if stream.get('isdefault')]
+                if len(defaults) != 1:
+                    return
+                candidates = defaults
+            index = candidates[0].get('index')
+            current = properties.get('currentsubtitle') or {}
+            if (isinstance(index, int) and index >= 0
+                    and (index != current.get('index') or not properties.get('subtitleenabled'))):
+                # A successful YouTube subtitle selection is local to this
+                # playback. Preserve Kodi's global language/forced preference.
+                self.setSubtitleStream(index)
+                self.log.debug('Selected preferred subtitle: %s', language)
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            self.log.debug('Unable to select preferred subtitle at playback start')
+
     def onAVStarted(self):
         ui = self._ui
         if ui.get_property(PLAY_USING, as_bool=True):
@@ -443,6 +545,10 @@ class PlayerMonitor(xbmc.Player):
                                       log_redact=True)
         if not player_data:
             return
+        # Consume PLAYER_DATA before selecting so later callbacks and manual
+        # track changes cannot apply this startup preference again.
+        self._apply_preferred_audio(player_data)
+        self._apply_preferred_subtitle(player_data)
         self.cleanup_threads()
 
         try:

@@ -1,6 +1,7 @@
 """Run the real manifest methods without requiring a Kodi installation."""
 import ast
 import html
+import itertools
 import os
 import re
 import tempfile
@@ -13,7 +14,7 @@ from urllib.parse import unquote, urlencode, urlunsplit
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'resources/lib/youtube_plugin/youtube/client/player_client.py'
 SETTINGS = ROOT / 'resources/lib/youtube_plugin/kodion/settings/abstract_settings.py'
-METHODS = {'_hdr_transfer', '_process_adaptive_streams', '_generate_mpd_manifest'}
+METHODS = {'_get_stream_format', '_hdr_transfer', '_process_adaptive_streams', '_generate_mpd_manifest'}
 CONSTANTS = {'INTEGER_FPS_SCALE', 'FRACTIONAL_FPS_SCALE', 'QUALITY_FACTOR', 'LANG_ROLE_DETAILS'}
 
 
@@ -78,6 +79,7 @@ class ManifestTests(unittest.TestCase):
         self.client.log = SimpleNamespace(debugging=False, debug=lambda *a, **kw: None)
         self.client._context = SimpleNamespace(
             get_settings=lambda: self.settings, inputstream_adaptive_capabilities=lambda: {'av01', 'mp4a'},
+            get_ui=lambda: SimpleNamespace(bold=lambda text: text),
             get_language_name=lambda language: {'ja': 'Japanese', 'en-US': 'English & US'}.get(language, language),
             localize=lambda key: 'Automatic' if key == 'stream.automatic' else key)
         self.client._process_url_params = lambda url, **kw: url
@@ -98,6 +100,83 @@ class ManifestTests(unittest.TestCase):
         url, details = self.client._generate_mpd_manifest(*groups, subs_data=None)
         self.assertTrue(url)
         return ET.parse(Path(self.temp.name)/'fixture.mpd').getroot(), groups, details
+
+    def default_audio(self, tracks):
+        root, _, _ = self.manifest([video(699, 1920, 1080)] + tracks)
+        defaults = root.findall('.//d:AdaptationSet[@contentType="audio"][@default="true"]', NS)
+        self.assertEqual(1, len(defaults))
+        return defaults[0]
+
+    def test_chinese_precedes_japanese_english_and_configured_language(self):
+        self.client._language_base = 'en'
+        tracks = [audio('ja.4'), audio('en.4'), audio('zh-Hans.3')]
+        for ordered in itertools.permutations(tracks):
+            with self.subTest(order=[a['audioTrack']['id'] for a in ordered]):
+                self.assertEqual('zh-Hans', self.default_audio(list(ordered)).get('lang'))
+
+    def test_chinese_tag_matching_accepts_regions_scripts_and_case(self):
+        for language in ('zh', 'zh-CN', 'zh-TW', 'zh-Hans', 'zh-Hant', 'ZH-hAnT', 'zh_CN'):
+            with self.subTest(language=language):
+                default = self.default_audio([audio('ja.4'), audio('en-US.3'), audio(language+'.10')])
+                self.assertEqual(language, default.get('lang'))
+
+    def test_japanese_selects_english_with_stable_role_preference(self):
+        tracks = [audio('JA.4'), audio('en-US.10'), audio('en.3')]
+        for ordered in itertools.permutations(tracks):
+            with self.subTest(order=[a['audioTrack']['id'] for a in ordered]):
+                default = self.default_audio(list(ordered))
+                self.assertEqual('en', default.get('lang'))
+                self.assertTrue(default.find('d:Representation', NS).get('id').endswith('.en.3'))
+
+    def test_chinese_role_preference_and_dub_settings(self):
+        for feature, role in ((None, '4'), ('prefer_dub', '3'), ('prefer_auto_dub', '10')):
+            self.features.difference_update({'prefer_dub', 'prefer_auto_dub'})
+            if feature:
+                self.features.add(feature)
+            tracks = [audio('zh.10'), audio('zh.3'), audio('zh.4'), audio('ja.4')]
+            for ordered in (tracks, list(reversed(tracks))):
+                with self.subTest(feature=feature, reversed=ordered != tracks):
+                    default = self.default_audio(ordered)
+                    self.assertTrue(default.find('d:Representation', NS).get('id').endswith('.zh.'+role))
+
+    def test_japanese_english_rule_respects_automatic_dub_preference(self):
+        self.features.add('prefer_auto_dub')
+        default = self.default_audio([audio('ja.4'), audio('en-US.10'), audio('en.3')])
+        self.assertEqual('en-US', default.get('lang'))
+
+    def test_same_role_uses_configured_region_then_stable_language_tie(self):
+        tracks = [audio('zh-TW.4'), audio('zh-CN.4'), audio('ja.4')]
+        for configured, expected in (('zh-tw', 'zh-TW'), ('', 'zh-CN')):
+            self.client._language_base = configured
+            for ordered in (tracks, list(reversed(tracks))):
+                with self.subTest(configured=configured, reversed=ordered != tracks):
+                    self.assertEqual(expected, self.default_audio(ordered).get('lang'))
+
+    def test_original_role_precedes_regional_match_and_other_codec(self):
+        self.client._language_base = 'zh-TW'
+        original = audio('zh-CN.4')
+        dubbed = audio('zh-TW.3')
+        dubbed['mimeType'] = 'audio/webm; codecs="opus"'
+        self.features.add('opus')
+        self.client._context.inputstream_adaptive_capabilities = lambda: {'av01', 'mp4a', 'opus'}
+        for ordered in ((original, dubbed), (dubbed, original)):
+            with self.subTest(order=[a['audioTrack']['id'] for a in ordered]):
+                self.assertEqual('zh-CN', self.default_audio(list(ordered)).get('lang'))
+
+    def test_unplayable_chinese_track_does_not_override_english(self):
+        unsupported = audio('zh.4')
+        unsupported['mimeType'] = 'audio/mp4; codecs="unknown"'
+        self.assertEqual('en-US', self.default_audio([unsupported, audio('ja.4'), audio('en-US.3')]).get('lang'))
+
+    def test_other_languages_and_japanese_without_english_keep_existing_default(self):
+        for tracks, expected in (([audio('fr.4'), audio('en.3')], 'fr'),
+                                 ([audio('ja.4'), audio('fr.3')], 'ja')):
+            with self.subTest(expected=expected):
+                self.assertEqual(expected, self.default_audio(tracks).get('lang'))
+
+    def test_list_only_selection_has_one_default_with_the_same_language_rule(self):
+        self.selection = {'list'}
+        self.assertEqual('zh-Hant', self.default_audio([audio('ja.4'), audio('en.3'), audio('zh-Hant.3')]).get('lang'))
 
     def test_hlg_and_pq_remain_separate_with_correct_cicp(self):
         pq = video(700, 1920, 1080, 'COLOR_TRANSFER_CHARACTERISTICS_SMPTE2084')
@@ -124,6 +203,38 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertTrue(details['multi_language'])
         self.assertIn('English & US', next(s for s in sets if s.get('lang') == 'en-US').get('name'))
+
+    def test_nonstandard_aspect_ratio_uses_actual_height_not_quality_limit(self):
+        for width, height in ((2560, 1600), (2880, 1440), (2048, 1536),
+                              (2560, 1080), (2048, 1080)):
+            with self.subTest(width=width, height=height):
+                root, _, _ = self.manifest([video(400, width, height), audio()])
+                fixed = next(s for s in root.findall('.//d:AdaptationSet[@contentType="video"]', NS)
+                             if 'Automatic' not in s.get('name'))
+                self.assertIn(str(height)+'p', fixed.get('name'))
+                self.assertNotIn('4K', fixed.get('name'))
+                representation = fixed.find('d:Representation', NS)
+                self.assertEqual(str(width), representation.get('width'))
+                self.assertEqual(str(height), representation.get('height'))
+
+    def test_cropped_uhd_retains_width_and_actual_height_in_label(self):
+        root, _, _ = self.manifest([video(401, 3840, 1600), audio()])
+        fixed = next(s for s in root.findall('.//d:AdaptationSet[@contentType="video"]', NS)
+                     if 'Automatic' not in s.get('name'))
+        self.assertIn('1600p', fixed.get('name'))
+        self.assertIn('4K', fixed.get('name'))
+        representation = fixed.find('d:Representation', NS)
+        self.assertEqual('3840', representation.get('width'))
+        self.assertEqual('1600', representation.get('height'))
+
+    def test_fixed_groups_do_not_mix_actual_dimensions_with_same_height_label(self):
+        root, _, _ = self.manifest([video(400, 2560, 1440), video(399, 2048, 1440), audio()])
+        fixed_sets = [s for s in root.findall('.//d:AdaptationSet[@contentType="video"]', NS)
+                      if 'Automatic' not in s.get('name')]
+        self.assertEqual(2, len(fixed_sets))
+        self.assertTrue(all(len(s.findall('d:Representation', NS)) == 1 for s in fixed_sets))
+        self.assertEqual({'2048', '2560'},
+                         {s.find('d:Representation', NS).get('width') for s in fixed_sets})
 
     def test_unknown_audio_role_is_kept_as_alternate(self):
         root, _, _ = self.manifest([video(699, 1920, 1080), audio('en-US.42'), audio('ja.4')])
