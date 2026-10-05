@@ -1641,29 +1641,6 @@ class Provider(AbstractProvider):
                 ]
                 watch_history_item.add_context_menu(context_menu)
                 result.append(watch_history_item)
-            elif local_history:
-                watch_history_item = DirectoryItem(
-                    localize('history'),
-                    create_uri((PATHS.HISTORY, 'list')),
-                    image='{media}/history.png',
-                )
-                context_menu = [
-                    menu_items.history_local_clear(
-                        context
-                    ),
-                    menu_items.separator(),
-                    menu_items.folder_play(
-                        context,
-                        path=PATHS.HISTORY,
-                    ),
-                    menu_items.folder_play(
-                        context,
-                        path=PATHS.HISTORY,
-                        order='shuffle',
-                    ),
-                ]
-                watch_history_item.add_context_menu(context_menu)
-                result.append(watch_history_item)
 
         # (my) playlists
         if logged_in and settings_bool(settings.SHOW_PLAYLISTS, True):
